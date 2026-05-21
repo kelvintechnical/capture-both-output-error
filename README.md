@@ -703,54 +703,247 @@ more
 | `Permission denied` on `sudo cmd > file` | The `>` runs as you. Use `sudo tee` or `sudo bash -c 'cmd > file'` |
 
 ---
+# Task 15 — Process Substitution Breakdown
 
-### Task 15 — Process substitution `> >(cmd)`
+## First: The "File Descriptor" Mental Model
 
-**Purpose:** Send a stream to another command's stdin as if it were a file. Useful for live-filtering errors.
+Before anything else, you need this mental model:
+
+**Every running process has 3 built-in "pipes" (called file descriptors):**
+
+| Number | Name | What it is |
+|---|---|---|
+| `0` | stdin | the pipe data comes *in* from |
+| `1` | stdout | the pipe normal output goes *out* to |
+| `2` | stderr | the pipe error messages go *out* to |
+
+Think of them as **numbered output ports on the back of a machine.**
+
+---
+
+## The `>` and `2>` translations (plain English)
+
+| Syntax | Human English |
+|---|---|
+| `> file.log` | "Send port 1 (stdout) into this file" |
+| `2> file.log` | "Send port 2 (stderr) into this file" |
+| `2>&1` | "Plug port 2 into wherever port 1 is currently going" |
+| `> >(cmd)` | "Send port 1 into this *command* instead of a file" |
+| `2> >(cmd)` | "Send port 2 into this *command* instead of a file" |
+
+**`2>&1` decoded word by word:**
+- `2>` = "redirect stderr"
+- `&1` = "to the same destination as file descriptor 1"
+- Together: *"merge errors into the same stream as regular output"*
+
+---
+
+## What is `>(cmd)` actually doing?
+
+Normally `>` expects a **filename**. Process substitution tricks bash into creating a **temporary named pipe (FIFO)** and gives you back a fake filename pointing to it — so the redirected data flows into `cmd`'s stdin instead of a file on disk.
+
+```
+Without process substitution:   ls /etc  >  myfile.log
+With process substitution:      ls /etc  >  >(grep something)
+                                              ^^^^^^^^^^^^^^^^^
+                                         bash creates a temp FIFO here
+```
+
+
+## Lab 15a — Baseline: see stdout and stderr raw
+
+**Goal:** Understand what the original command produces before any filtering.
 
 ```bash
-ls /etc /nope > >(grep -v '^/' > stdout-noslash.log) 2> >(tee errors-only.log >&2)
-echo "---- stdout-noslash.log ----"
+ls /etc /nope
+```
+
+**What you'll see:**
+- A wall of `/etc` contents on stdout
+- `ls: cannot access '/nope': No such file or directory` on stderr
+
+**Key point:** Both streams are mixed in your terminal right now. The labs below separate them.
+
+---
+
+## Lab 15b — Redirect stdout to a file (basic `>`)
+
+```bash
+ls /etc /nope > stdout.log
+cat stdout.log
+```
+
+**What happened:** Port 1 (stdout) went to the file. Port 2 (stderr) still printed to your terminal.
+
+---
+
+## Lab 15c — Redirect stderr to a file (`2>`)
+
+```bash
+ls /etc /nope 2> errors.log
+cat errors.log
+```
+
+**What happened:** Port 2 (stderr) went to the file. Port 1 (stdout) still printed to terminal.
+
+---
+
+## Lab 15d — Redirect both to the same file (`2>&1`)
+
+```bash
+ls /etc /nope > both.log 2>&1
+cat both.log
+```
+
+**Plain English:** "Send stdout to `both.log`, then send stderr to wherever stdout is going." Order matters — `2>&1` must come *after* `>`.
+
+---
+
+## Lab 15e — What happens if you reverse the order (common gotcha)
+
+```bash
+ls /etc /nope 2>&1 > reversed.log
+cat reversed.log
+```
+
+**You'll notice:** stderr still prints to terminal — it doesn't go to the file. That's because `2>&1` ran first (when stdout was still the terminal), *then* stdout got redirected to the file. **Stderr was already wired up and didn't follow.**
+
+---
+
+## Lab 15f — Separate stdout and stderr to different files
+
+```bash
+ls /etc /nope > stdout-only.log 2> stderr-only.log
+echo "STDOUT:" && cat stdout-only.log
+echo "STDERR:" && cat stderr-only.log
+```
+
+**What happened:** Each stream went to its own file independently.
+
+---
+
+## Lab 15g — Introduce `tee` (see it AND save it)
+
+**`tee` = splits a stream: saves to file AND passes it through to stdout simultaneously**
+
+```bash
+ls /etc /nope 2> >(tee errors-tee.log)
+cat errors-tee.log
+```
+
+**What happened:** stderr went into `tee`, which both printed it to your screen and saved it to the log.
+
+---
+
+## Lab 15h — Process substitution on stdout: `> >(cmd)`
+
+```bash
+ls /etc /nope > >(cat > piped-stdout.log)
+cat piped-stdout.log
+```
+
+**What happened:** Instead of writing directly to a file, stdout flowed into `cat`, which wrote it to the file. This proves `>(cmd)` works — same result, one extra hop.
+
+---
+
+## Lab 15i — Filter stdout with grep via process substitution
+
+```bash
+ls /etc /nope > >(grep "^a" > starts-with-a.log) 2>/dev/null
+cat starts-with-a.log
+```
+
+**What happened:** stdout piped into `grep`, which only kept lines starting with `a`. `2>/dev/null` silences errors for now.
+
+---
+
+## Lab 15j — The `^/` grep filter explained
+
+```bash
+ls /etc /nope > >(grep -v '^/' > stdout-noslash.log) 2>/dev/null
+cat stdout-noslash.log
+```
+
+**`-v '^/'` means:** "exclude lines that *start with* `/`"
+
+When `ls` lists multiple directories, it prints headers like `/etc:` — this filter strips those headers, leaving only filenames.
+
+---
+
+## Lab 15k — Process substitution on stderr: `2> >(cmd)`
+
+```bash
+ls /etc /nope 2> >(grep "nope" > nope-errors.log)
+cat nope-errors.log
+```
+
+**What happened:** stderr flowed into a `grep` that only kept lines mentioning "nope".
+
+---
+
+## Lab 15l — The `>&2` inside a subshell (echo errors back to terminal)
+
+```bash
+ls /etc /nope 2> >(tee errors.log >&2)
+```
+
+**Plain English of `>&2` here:** After `tee` saves the line to the file, `>&2` says "also send it back out to stderr so the user still sees it on screen."
+
+Without `>&2`, tee would silently write to the file and you'd never see the error in your terminal.
+
+---
+
+## Lab 15m — Combine both streams into process substitution simultaneously
+
+```bash
+ls /etc /nope \
+  > >(grep -v '^/' > stdout-noslash.log) \
+  2> >(tee errors-only.log >&2)
+```
+
+**This is the full Task 15 command.** Now you've built up to it piece by piece.
+
+---
+
+## Lab 15n — Verify both output files look correct
+
+```bash
+echo "---- stdout-noslash.log (first 3 lines) ----"
 head -3 stdout-noslash.log
+
 echo "---- errors-only.log ----"
 cat errors-only.log
 ```
 
-**Expected output (excerpt):**
+**Expected:**
+- `stdout-noslash.log` → filenames only, no `/etc:` header lines
+- `errors-only.log` → the `/nope` error message
+
+---
+
+## Lab 15o — Break it on purpose (test the bash-only restriction)
+
+```bash
+sh -c 'ls /etc /nope > >(cat)'
+```
+
+**Expected error:** `syntax error near unexpected token`
+
+**Why:** `>(...)` is a **bash/zsh feature only**. POSIX `sh` doesn't support it. On RHCA you must confirm your shebang or interactive shell is `bash`.
+
+---
+
+## Summary Cheat Sheet
 
 ```
-ls: cannot access '/nope': No such file or directory
----- stdout-noslash.log ----
-adjtime
-alternatives
-audit
----- errors-only.log ----
-ls: cannot access '/nope': No such file or directory
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `>(cmd)` | Process substitution — bash creates a FIFO and pipes the redirected output into `cmd` |
-| `> >(grep ...)` | stdout piped into `grep` |
-| `2> >(tee ...)` | stderr piped into `tee` |
-| `>&2` (inside) | Echo back to the original stderr so the user still sees it |
-
-**Output decoded**
-
-| File | Meaning |
-|---|---|
-| `stdout-noslash.log` | Lines that don't start with `/` (filtered by grep) |
-| `errors-only.log` | All stderr lines (via tee) |
-
-**Why a sysadmin needs this on RHCA RH342:** Split a noisy command's streams to separate filters in one invocation.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `syntax error near unexpected token >` | `>(...)` is bash/zsh only — switch shell |
+Port 1 = stdout    → redirect with >
+Port 2 = stderr    → redirect with 2>
+2>&1               → "merge stderr into stdout's current destination"
+>(cmd)             → "use a command as if it were a file"
+> >(cmd)           → stdout into a command
+2> >(cmd)          → stderr into a command
+tee                → save AND pass through simultaneously
+>&2 inside a sub   → echo back to stderr so user still sees it
 
 ---
 
