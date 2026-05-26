@@ -1,1498 +1,573 @@
-# Lab 04: Capture Both Output and Error — `&>`, `2>&1`
+# Lab: Capture Both Output and Error — `&>`, `2>&1`
 
-**Series:** File Operations & Shell Fundamentals · **Lab 4 of the Novice → RHCA path**  
-**Certifications covered:** RHCSA EX200 (foundational), RHCE EX294 (every Ansible path reference), CKA (every kubelet/etcd/containerd path), RHCA building blocks (RH342 troubleshooting, RH358 services, RH236 storage)  
-**Prerequisite:** Bash basics (variables, pipes)  
-**Time Estimate:** 30–40 minutes  
-**Difficulty arc:** Tasks 1–6 foundation · 7–12 practical · 13–17 advanced · 18–20 exam-realistic
-
----
-
-## 🎯 Objective
-
-Capture everything a command produces — both **standard output** (success messages, file listings, query results) and **standard error** (warnings, permission denied, errors) — into the same file or `tee` stream. By the end of this lab you will never again miss an error message because it "didn't show up in the log."
+**Series:** linux-ops-mastery — RHCSA Shells, Terminals & Redirection
+**Subjects covered:** Merging stdout and stderr into a single stream, the bash shorthand `&>`, the POSIX-portable form `> file 2>&1`, append variants `&>>` and `>> file 2>&1`, the critical "order matters" rule (`2>&1` after `>`, not before), discarding both streams with `&> /dev/null`, exit-code preservation through combined redirection, and when to merge vs. split streams in forensic captures
+**Career arcs covered:** RHCSA (every "save the output" task in EX200 — combining streams keeps the answer complete), RHCE (Ansible `command:` / `shell:` modules capture both into `result.stdout` + `result.stderr`), SRE (incident logging: `cmd &>> /var/log/incident.log` keeps a complete chronological record), DevOps (CI/CD job logs are nearly always combined-stream), AI/MLOps (`python train.py &> runs/exp-42.log` is the single command experiment-capture pattern)
+**Prerequisite:** Labs 01 and 02 (you understand FD 1, FD 2, `>` and `2>` independently)
+**Time Estimate:** 30 to 45 minutes
+**Difficulty arc:** Task 1 foundation · 2–3 `&>` and `2>&1` core forms · 4–5 append variants and the order-matters rule · 6 RHCSA exam-realistic capstone
 
 ---
 
-## 🧠 Concept: Three File Descriptors Always Open
+## Objective
 
-Every process in Linux starts with **three** pre-opened file descriptors (FDs):
+Stop missing half the evidence. Until now you have redirected stdout *or* stderr but never both at the same time. By the end of this lab you will combine the two streams into a single file in two different syntaxes — bash's shorthand `&>` and the POSIX-portable `2>&1` form — and you will know exactly **why** the order of those operators matters. The next time a cron job "succeeded" but did the wrong thing, the combined log you saved will contain the warning that explains it.
 
-| FD | Stream | Default destination | When it's used |
-|---|---|---|---|
-| **0** | **stdin** | Keyboard | Reading input |
-| **1** | **stdout** | Terminal screen | Normal output (success) |
-| **2** | **stderr** | Terminal screen | Error/warning output |
+The capstone is an exam-realistic prompt: *"Run a `find` against `/etc` and save both the matching paths and any permission errors to `/root/find-evidence.log`. Verify that the log contains both the successful matches and at least one `Permission denied` line."*
 
-Even though stdout and stderr both **display** on the same screen, they are **separate streams**. `>` only redirects stdout. Errors slip past it onto the screen unless you capture them deliberately.
-
-```
-ls /etc /nope
-  ├── stdout (FD 1) → "adjtime  alternatives  ..."     → screen by default
-  └── stderr (FD 2) → "ls: cannot access '/nope': ..."  → screen by default
-
-ls /etc /nope > out.log
-  ├── stdout → out.log
-  └── stderr → STILL screen (not captured!)
-
-ls /etc /nope > out.log 2>&1
-  ├── stdout → out.log
-  └── stderr → out.log (combined)
-
-ls /etc /nope &> out.log
-  ├── stdout → out.log
-  └── stderr → out.log (shorthand — identical result)
-```
-
-> **Why this matters on every cert:** RHCSA Task 14 says "save the output to a file." If you forget `2>&1`, your `find / -mtime -30` produces a partial file plus a wall of `Permission denied` on screen — graders mark this wrong. Ansible's `command:` and `shell:` modules capture both streams by default but expose them as separate keys; you must know which to inspect.
+> **Lab safety note:** Every command in this lab reads from `/etc`, `/var/log`, or writes to your sandbox under `/tmp/combo-lab`. No system files are modified. The same operators you practice here are the ones you will type during exam Task 14 and during every real-world incident response.
 
 ---
 
-## 📚 Redirection Reference
+## Concept: Two Streams, One Destination
 
-| Operator | Meaning | File state if exists | File state if missing |
-|---|---|---|---|
-| `> file` | stdout → file | **Overwrites** | Creates |
-| `>> file` | stdout → file (append) | Appends | Creates |
-| `2> file` | stderr → file | Overwrites | Creates |
-| `2>> file` | stderr → file (append) | Appends | Creates |
-| `> file 2>&1` | stdout AND stderr → file | Overwrites | Creates |
-| `&> file` | stdout AND stderr → file (shorthand) | Overwrites | Creates |
-| `&>> file` | stdout AND stderr → file (append) | Appends | Creates |
-| `> /dev/null` | Discard stdout | — | — |
-| `2> /dev/null` | Discard stderr | — | — |
-| `&> /dev/null` | Discard both | — | — |
-| `2>&1` | "Send stream 2 to where stream 1 is going" | depends on `>` placement | depends on `>` placement |
-| `\| tee FILE` | Display AND save stdout | Overwrites (use `-a` to append) | Creates |
-| `2>&1 \| tee FILE` | Display AND save both streams | Overwrites | Creates |
+You already know that stdout (FD 1) and stderr (FD 2) are independent. To capture both into one place, you have to **make FD 2 point at the same destination as FD 1** — or vice versa. Bash offers two syntaxes for this. They produce the same result; they differ only in portability and operator order.
 
-> **The single most important rule:** `> file 2>&1` works. `2>&1 > file` does **not**. The order matters because `2>&1` copies wherever stdout is currently pointing — so stdout must already point to the file when `2>&1` runs.
+```
+   ┌─────────────────────────────────────────────────────┐
+   │   Your command (find, ls, dnf, python ...)          │
+   ├─────────────────────────────────────────────────────┤
+   │   FD 1  stdout  ────┐                               │
+   │                     ├──>  ONE file (or pipe, or /dev/null)
+   │   FD 2  stderr  ────┘                               │
+   └─────────────────────────────────────────────────────┘
+
+   `cmd &> file`            bash shorthand — merge then write
+   `cmd > file 2>&1`        POSIX — open file on FD1, THEN clone FD1 onto FD2
+   `cmd 2>&1 > file`        WRONG — clones the terminal onto FD2, then redirects FD1 only
+```
+
+The third form is the trap. Most shell beginners type it once, see stderr still on screen, and assume it's broken — they were just one operator-order away from working. We'll do the experiment in Task 3 and never get it wrong again.
+
+> **Why this matters:** Combined streams give you the **complete record** of what a command did. Cron jobs, package installs, training scripts, build pipelines — anything where the diagnostics matter as much as the data needs `&>` or `2>&1` to retain a full audit trail.
 
 ---
 
-## 🛣️ RHCA Pathway Sidebar
+## 📜 Why Combined Streams Exist — The Story
 
-| Cert level | Why this lab matters |
-|---|---|
-| **RHCSA EX200** | Tasks 11, 13, 14, 18, 19 — every "save the output" task requires this |
-| **RHCE EX294** | Ansible `command:` / `shell:` modules expose `stdout` and `stderr` separately — knowing which to check matters |
-| **CKA** | `kubelet --v=4` and `journalctl -u kubelet` produce both streams; capturing both is required for postmortems |
-| **RHCA — RH342 (Troubleshooting)** | Capture cmd output during incident — `cmd &> /tmp/incident-$(date +%s).log` |
-| **RHCA — RH358 (Services)** | Service start-failure forensics: `systemctl status SERVICE 2>&1 \| tee output.log` |
-| **RHCA — RH236 (Storage)** | Gluster heal/repair commands emit warnings to stderr — must be captured |
+When Dennis Ritchie split stderr off from stdout in **1974**, he immediately discovered a new problem: sometimes you actually *do* want them merged. Cron jobs, for instance, run unattended — if errors and data scroll past nobody's terminal, you need a single log that captures everything in the order it happened.
 
----
+The Bourne shell (1977) introduced `2>&1` for this purpose: an explicit "duplicate FD 1 onto FD 2." It was deliberately verbose because the language designer (Stephen Bourne) wanted you to *think* about what you were doing. The order-matters rule is a direct consequence: redirections happen left-to-right, and `2>&1` copies wherever FD 1 currently points.
 
-## 🔧 The 20 Tasks
+Bash later (around the mid-1990s) added `&>` as a convenience shortcut for the most common case: `> file 2>&1` is so common that bash gave it a single operator. Korn shell does not have it; dash does not have it; busybox sh does not have it. That is why every portable script on the planet still writes `> file 2>&1` instead of `&> file`.
 
-> Each task ends with three callouts: **Switches** (every operator/flag explained), **Output decoded** (what each line means), and **Troubleshoot** (what to do if it goes wrong).
+> **The point of the story:** `2>&1` is the original, portable, slightly verbose form that exists in every Bourne-family shell since 1977. `&>` is bash sugar from the 1990s. Pick the right one for the target environment: production scripts that may run on `/bin/sh` get `> file 2>&1`; interactive bash one-liners get `&>`.
 
 ---
 
-### Task 1 — Set up the lab workspace
+## 👪 The Combined-Stream Family — Who Lives There
 
-**Purpose:** Build a clean directory so each subsequent task has predictable filenames.
+A small but high-impact family. Memorize all of it.
 
-```bash
-mkdir -p ~/redir-lab
-cd ~/redir-lab
-pwd
-```
+### The four overwrite forms
 
-**Expected output:**
-
-```
-/home/ec2-user/redir-lab
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mkdir -p` | Create with missing parents; do not error if it exists |
-| `cd` | Move into the directory |
-| `pwd` | Confirm location |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `/home/ec2-user/redir-lab` | Workspace ready |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `Permission denied` on `mkdir` | Use a path under your own home |
-
----
-
-### Task 2 — See stdout and stderr both on screen
-
-**Purpose:** Demonstrate that even though they look identical on screen, the two streams are separate.
-
-```bash
-ls /etc /nonexistent
-```
-
-**Expected output (interleaved):**
-
-```
-ls: cannot access '/nonexistent': No such file or directory
-/etc:
-adjtime  alternatives  audit  bashrc  ...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `ls A B` | List two paths; valid entries go to stdout, errors to stderr |
-
-**Output decoded**
-
-| Line | Stream |
-|---|---|
-| `ls: cannot access ...` | stderr (FD 2) |
-| `/etc:` header and file names | stdout (FD 1) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Only one stream displayed | Some shells buffer differently — they still arrive at the terminal |
-
----
-
-### Task 3 — Redirect stdout only with `>`
-
-**Purpose:** Most basic redirection — only success output goes to file; errors stay on screen.
-
-```bash
-ls /etc /nonexistent > out.log
-cat out.log
-```
-
-**Expected output (errors on screen during `ls`, then `cat` shows only stdout):**
-
-```
-ls: cannot access '/nonexistent': No such file or directory
-/etc:
-adjtime
-alternatives
-audit
-bashrc
-...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `> FILE` | Redirect FD 1 (stdout) to FILE (overwrite) |
-
-**Output decoded**
-
-| Phase | What you see |
-|---|---|
-| During `ls` | stderr line displayed on screen (`>` didn't capture it) |
-| `cat out.log` | Only the `/etc:` listing — stderr was not saved |
-
-**Why this matters:** This is the #1 beginner mistake — "I redirected the command and the error STILL appeared." Yes, because `>` doesn't capture stderr.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Errors clutter screen | Add `2>&1` (Task 7) or `2> /dev/null` (Task 12) |
-
----
-
-### Task 4 — Redirect stderr only with `2>`
-
-**Purpose:** Send errors to a file while letting normal output appear on screen.
-
-```bash
-ls /etc /nonexistent 2> err.log
-cat err.log
-```
-
-**Expected output (stdout on screen, then err.log content via cat):**
-
-```
-/etc:
-adjtime
-...
-ls: cannot access '/nonexistent': No such file or directory
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `2> FILE` | Redirect FD 2 (stderr) to FILE (overwrite) |
-| `2>> FILE` | Same but append |
-
-**Output decoded**
-
-| Phase | What you see |
-|---|---|
-| During `ls` | The `/etc:` listing on screen — stdout untouched |
-| `cat err.log` | Just the error message — stderr was redirected here |
-
-**Why a sysadmin needs this on RHCA RH342:** When you want to see results LIVE but log errors separately for review.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Wrong file got the error | Make sure there's no space: `2>err.log` and `2> err.log` both work; `2 > err.log` does **not** |
-
----
-
-### Task 5 — The classic mistake: `2>&1 > file`
-
-**Purpose:** See the wrong order so you instantly recognize it on the exam.
-
-```bash
-ls /etc /nonexistent 2>&1 > wrong.log
-echo "----"
-cat wrong.log
-```
-
-**Expected output:**
-
-```
-ls: cannot access '/nonexistent': No such file or directory
-----
-/etc:
-adjtime
-alternatives
-...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `2>&1 > FILE` | **Wrong order** — `2>&1` runs FIRST, when stdout still points to the terminal; THEN `> FILE` redirects stdout to FILE |
-| Result | stderr still goes to terminal; only stdout reaches the file |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `cannot access ...` on screen | stderr leaked because `2>&1` copied the terminal-pointing FD |
-| `cat wrong.log` shows stdout only | Errors NOT captured |
-
-**Why a sysadmin needs to recognize this:** This pattern is in lots of bad Stack Overflow answers. Spot it and fix it.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Errors keep appearing on screen | Move `2>&1` AFTER the file redirect (Task 6) |
-
----
-
-### Task 6 — The correct form: `> file 2>&1`
-
-**Purpose:** Capture both streams into one file. Memorize this exact pattern.
-
-```bash
-ls /etc /nonexistent > right.log 2>&1
-echo "---- (nothing on screen above)"
-cat right.log
-```
-
-**Expected output:**
-
-```
----- (nothing on screen above)
-ls: cannot access '/nonexistent': No such file or directory
-/etc:
-adjtime
-alternatives
-...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `> FILE` | Send stdout to FILE first |
-| `2>&1` | THEN send stderr to wherever stdout is going (i.e., FILE) |
-
-**Output decoded**
-
-| Phase | What you see |
-|---|---|
-| During `ls` | Nothing on screen — both streams captured |
-| `cat right.log` | Errors AND listing — interleaved order depends on buffering |
-
-**Read `2>&1` literally as:** *"file descriptor 2, go to where file descriptor 1 is currently going."*
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Errors still on screen | You wrote `2>&1` before `>` — reverse the order |
-
----
-
-### Task 7 — Decode `2>&1` syntactically
-
-**Purpose:** Lock down the syntax so you never misread it.
-
-```bash
-# Equivalent forms
-ls /etc /nope > a.log 2>&1
-ls /etc /nope 2>&1 1> b.log    # same effect, different writing
-ls /etc /nope 1> c.log 2>&1    # explicit 1>
-
-ls -l a.log b.log c.log
-```
-
-**Expected output:**
-
-```
--rw-r--r--. 1 ec2-user ec2-user 4321 Sep 12 16:00 a.log
--rw-r--r--. 1 ec2-user ec2-user 4321 Sep 12 16:00 b.log
--rw-r--r--. 1 ec2-user ec2-user 4321 Sep 12 16:00 c.log
-```
-
-**Switches**
-
-| Token | Reading |
-|---|---|
-| `>` | Same as `1>` (stdout) — the `1` is implicit |
-| `1>` | Explicit stdout redirection |
-| `2>` | stderr redirection |
-| `&` (in `2>&1`) | "the same destination as" |
-| `2>&1` | "send FD 2 to where FD 1 is going" |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Three files, same size | All three syntactic forms are equivalent |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Confused by `&` | The `&` here is NOT background — only inside `>&N` does it mean "the same file descriptor" |
-
----
-
-### Task 8 — The `&>` shorthand
-
-**Purpose:** Bash-specific shorthand for `> file 2>&1`.
-
-```bash
-ls /etc /nonexistent &> both.log
-cat both.log
-```
-
-**Expected output:**
-
-```
-ls: cannot access '/nonexistent': No such file or directory
-/etc:
-adjtime
-alternatives
-...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `&> FILE` | Bash shorthand for `> FILE 2>&1` (capture both streams, overwrite) |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Combined output in one file | Same result as Task 6, fewer characters |
-
-> **Portability note:** `&>` is bash/zsh-specific. POSIX `/bin/sh` (dash on Debian/Ubuntu) does not understand it. For maximum portability use `> FILE 2>&1`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `&> not found` in a `sh` script | Switch script to `#!/bin/bash` or use the long form |
-
----
-
-### Task 9 — Append both streams with `&>>`
-
-**Purpose:** When you want to keep adding to a log file instead of overwriting.
-
-```bash
-ls /etc /nope &> combined.log
-ls /tmp /alsonope &>> combined.log
-cat combined.log
-wc -l combined.log
-```
-
-**Expected output (excerpt):**
-
-```
-ls: cannot access '/nope': No such file or directory
-/etc:
-adjtime
-...
-ls: cannot access '/alsonope': No such file or directory
-/tmp:
-systemd-private-...
-12  combined.log    (approximate)
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `&>>` | Append both stdout and stderr (bash 4+) |
-| Long form | `>> FILE 2>&1` |
-
-**Output decoded**
-
-| Phase | Effect |
-|---|---|
-| First `&>` | Created/overwrote `combined.log` |
-| Second `&>>` | Appended to the same file |
-| `wc -l` | Confirms both runs are captured |
-
-**Why a sysadmin needs this on RHCA RH358:** Long-running deploys want to **append** to a log, not overwrite each step.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `&>>` not recognized | Use `>> FILE 2>&1` (works in older bash too) |
-
----
-
-### Task 10 — Append the long way: `>> file 2>&1`
-
-**Purpose:** Portable append form.
-
-```bash
-ls /var/log >> portable.log 2>&1
-ls /etc/ssh >> portable.log 2>&1
-ls /missing >> portable.log 2>&1
-tail -3 portable.log
-```
-
-**Expected output:**
-
-```
-sshd_config
-sshd_config.d
-ls: cannot access '/missing': No such file or directory
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `>>` | Append stdout |
-| `2>&1` | Send stderr to wherever stdout is going (the append) |
-
-**Output decoded**
-
-| Line | Stream |
-|---|---|
-| `sshd_config` rows | stdout, appended |
-| `cannot access` row | stderr, also appended |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| File missing | Append creates if absent — same as `&>>` |
-
----
-
-### Task 11 — Send streams to separate files
-
-**Purpose:** When you want stdout and stderr in different logs for easier filtering.
-
-```bash
-ls /etc /nope > stdout.log 2> stderr.log
-echo "==== stdout.log ===="
-head -3 stdout.log
-echo "==== stderr.log ===="
-cat stderr.log
-```
-
-**Expected output:**
-
-```
-==== stdout.log ====
-/etc:
-adjtime
-alternatives
-==== stderr.log ====
-ls: cannot access '/nope': No such file or directory
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `> stdout.log` | stdout to one file |
-| `2> stderr.log` | stderr to a different file |
-| Both can be combined freely | Both redirections happen for one command |
-
-**Output decoded**
-
-| File | Contains |
-|---|---|
-| `stdout.log` | Normal listing |
-| `stderr.log` | Just the access error |
-
-**Why a sysadmin needs this on RHCA RH342:** Run a complex job; tail stdout for progress, watch stderr for problems — different windows, different priorities.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Wanted both in one file too | Add `tee` per stream (Task 14) — or run twice |
-
----
-
-### Task 12 — Discard a stream with `/dev/null`
-
-**Purpose:** Throw away noise (often unwanted `Permission denied` warnings).
-
-```bash
-find / -name "sshd_config" 2> /dev/null
-find / -name "sshd_config" > /dev/null
-find / -name "sshd_config" &> /dev/null; echo "exit=$?"
-```
-
-**Expected output:**
-
-```
-/etc/ssh/sshd_config
-(no output — stdout was discarded)
-exit=0
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `/dev/null` | Linux's "black hole" device — anything written is discarded |
-| `2> /dev/null` | Discard stderr (commonly used with `find`) |
-| `> /dev/null` | Discard stdout |
-| `&> /dev/null` | Discard both — used when you only care about the exit code |
-
-**Output decoded**
-
-| Form | Effect |
-|---|---|
-| First | Real hits shown, errors hidden — most common |
-| Second | Errors visible, stdout hidden — rare |
-| Third | Nothing visible, exit code preserved — for tests |
-
-**Why a sysadmin needs this on RHCSA Task 14:** `find / 2>/dev/null` hides the inevitable `Permission denied` floods on `/proc` and `/sys`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Errors still appear | You discarded the wrong stream — re-check `2>` vs `>` |
-
----
-
-### Task 13 — Tee both streams so you see AND save
-
-**Purpose:** `tee` writes its stdin to both stdout AND a file. Pair with `2>&1` to capture both streams.
-
-```bash
-ls /etc /nope 2>&1 | tee teed.log
-echo "---- file content ----"
-head -5 teed.log
-```
-
-**Expected output (live during ls + the tee'd file):**
-
-```
-ls: cannot access '/nope': No such file or directory
-/etc:
-adjtime
-...
----- file content ----
-ls: cannot access '/nope': No such file or directory
-/etc:
-adjtime
-alternatives
-audit
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `\| tee FILE` | Read stdin, write to terminal AND FILE |
-| `tee -a FILE` | Append to FILE instead of overwriting |
-| `2>&1 \| tee FILE` | Combine streams first, then tee both |
-
-**Output decoded**
-
-| Phase | What you see |
-|---|---|
-| Live | Combined output on screen — `tee` mirrors to terminal |
-| File | Identical content saved |
-
-**Why on RHCSA Task 18:** "Install package X and save the install log." `dnf install -y httpd 2>&1 | tee /var/tmp/install.log` shows progress AND saves it.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `tee` overwriting prior log | Use `tee -a` |
-| Need root-owned destination | `sudo tee` — your shell can't pipe into a sudo redirection, but it can pipe into sudo tee |
-
----
-
-### Task 14 — Tee with `sudo` correctly
-
-**Purpose:** `sudo command > /root/file` fails because the shell redirects as YOUR user. `sudo tee` is the canonical fix.
-
-```bash
-echo "hello root" | sudo tee /root/sudoed.log > /dev/null
-sudo cat /root/sudoed.log
-echo "more" | sudo tee -a /root/sudoed.log > /dev/null
-sudo cat /root/sudoed.log
-```
-
-**Expected output:**
-
-```
-hello root
-hello root
-more
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `sudo tee FILE` | Tee running as root, writing to a root-only file |
-| `> /dev/null` (after tee) | Don't echo what tee already printed |
-| `tee -a` | Append |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| First content | Written by first run |
-| Subsequent lines | Appended thanks to `-a` |
-
-**Why a sysadmin needs this on RHCSA Task 19:** "Save grep output of `/etc/shadow` to `/var/tmp/file`." Either `sudo grep ... > /var/tmp/file` (need to use `sudo bash -c`) or `sudo grep ... | sudo tee /var/tmp/file`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `Permission denied` on `sudo cmd > file` | The `>` runs as you. Use `sudo tee` or `sudo bash -c 'cmd > file'` |
-
----
-## Task 15 Human-English Breakdown
-
-Task 15 is about learning how Bash keeps normal output and error output separate, then learning how to send each one somewhere useful.
-
-The big idea:
-> A command can talk through more than one "pipe." Normal results come out of one pipe. Error messages come out of another pipe. Redirection lets us decide where each pipe goes.
-
----
-
-## First: The Three Built-In Pipes
-
-Every running command starts with three standard file descriptors:
-
-| Number | Name | Human meaning |
+| Syntax | Shell support | What it does |
 |---|---|---|
-| `0` | stdin | where input comes in |
-| `1` | stdout | where normal output goes out |
-| `2` | stderr | where error messages go out |
+| `cmd > file 2>&1` | POSIX (`sh`, `dash`, `bash`, `ksh`) | Open `file` on FD 1, then clone FD 1 onto FD 2 → both into `file` |
+| `cmd &> file` | bash (and ksh93+) | Shorthand for the above |
+| `cmd >& file` | csh / older bash | Legacy; avoid in new scripts |
+| `cmd 2>&1 > file` | POSIX, but **wrong intent** | Clones the **terminal** onto FD 2, then redirects FD 1 — stderr stays on screen |
 
-Think of a command like a machine with numbered ports on the back:
+### The four append forms
 
-- Port `0` receives input.
-- Port `1` sends normal results.
-- Port `2` sends complaints, warnings, and errors.
+| Syntax | Shell support | What it does |
+|---|---|---|
+| `cmd >> file 2>&1` | POSIX | Append both streams |
+| `cmd &>> file` | bash | Shorthand append |
+| `cmd >>file 2>>file` | POSIX, but **buggy** | Two separate appends — can interleave or drop bytes under fast writes |
+| `cmd &>> /var/log/x` | bash | Best for unattended log accumulation |
 
-When you run a command normally, both port `1` and port `2` usually print to your terminal, so it can look like everything is mixed together.
+### The discard forms
 
----
+| Syntax | Shell support | What it does |
+|---|---|---|
+| `cmd > /dev/null 2>&1` | POSIX | Silent mode — everything discarded |
+| `cmd &> /dev/null` | bash | Shorthand silent mode |
+| `cmd 2>/dev/null 1>/dev/null` | POSIX, long form | Same effect, more typing |
 
-## The Main Command We Are Studying
-
-```bash
-ls /etc /nope
-```
-
-Human English:
-> "List the contents of `/etc` and also try to list `/nope`."
-
-What happens:
-- `/etc` exists, so `ls` produces normal output.
-- `/nope` does not exist, so `ls` produces an error.
-
-That means this one command gives us both streams:
-- stdout: the successful `/etc` listing
-- stderr: the `/nope` error message
-
-This makes it perfect for practicing redirection.
+> **The point of the family tree:** Pick the right operator family by asking three questions: *Is this script POSIX-portable?* (`2>&1`), *Am I appending or overwriting?* (`&>>` vs `&>`), and *Do I want the output at all?* (`/dev/null` vs file).
 
 ---
 
-## Lab 15a: See stdout and stderr Raw
+## 🔬 The Anatomy of `> file 2>&1` — Why Order Matters
 
-```bash
-ls /etc /nope
+```
+$ cmd > file 2>&1
+  │   │  │   │
+  │   │  │   └─ "Send stream 2 to wherever stream 1 is CURRENTLY going."
+  │   │  └─ This file is where stream 1 is going right now.
+  │   └─ Redirect stream 1 to a file.
+  └─ The command whose output we want to capture.
+
+EVALUATION ORDER (left to right):
+  1. open(file, O_WRONLY|O_CREAT|O_TRUNC) → FD now points at file
+  2. dup2(opened_fd, 1)                   → FD 1 (stdout) → file
+  3. dup2(1, 2)                           → FD 2 (stderr) → file (because FD 1 now points at file)
+  4. exec(cmd ...)                        → both streams flow into file
+
+—————————————————————————————————————————————————————————————————
+
+$ cmd 2>&1 > file       ← WRONG ORDER
+  │   │    │
+  │   │    └─ Redirect stream 1 to a file.
+  │   └─ "Send stream 2 to wherever stream 1 is CURRENTLY going." (stdout = terminal at this moment)
+  └─ The command.
+
+EVALUATION ORDER (left to right):
+  1. dup2(terminal, 2)                    → FD 2 (stderr) → terminal (no change)
+  2. open(file, O_WRONLY|O_CREAT|O_TRUNC) → FD now points at file
+  3. dup2(opened_fd, 1)                   → FD 1 (stdout) → file
+  4. exec(cmd ...)                        → stdout → file; stderr → terminal (still!)
 ```
 
-Human English:
-> "Run the command normally. Do not redirect anything yet."
-
-What we are doing:
-> We are creating both successful output and an error so we can see the difference between stdout and stderr.
-
-What you should notice:
-- The `/etc` results print to the terminal.
-- The `/nope` error also prints to the terminal.
-
-Important point:
-> They look mixed together on screen, but Bash still knows they came from two different ports.
+> **Reading rule:** `2>&1` is a **snapshot** of where FD 1 currently points. Whatever you do to FD 1 *after* `2>&1` does **not** retroactively change FD 2. Put `2>&1` **after** the `>` operator, always.
 
 ---
 
-## Lab 15b: Redirect stdout to a File
+## 📚 Combined-Stream Reference Table
 
-```bash
-ls /etc /nope > stdout.log
-cat stdout.log
-```
+| Task | Command | Notes |
+|---|---|---|
+| Combine streams to a new file | `cmd > file 2>&1` | POSIX — works in `/bin/sh` |
+| Combine streams to a new file (bash) | `cmd &> file` | Bash shorthand |
+| Combine streams, append | `cmd >> file 2>&1` | POSIX append |
+| Combine streams, append (bash) | `cmd &>> file` | Bash append |
+| Discard both streams | `cmd > /dev/null 2>&1` or `cmd &> /dev/null` | Silent mode |
+| Pipe both streams to another command | `cmd 2>&1 \| next` | Merge before pipe |
+| Pipe both streams (bash shorthand) | `cmd \|& next` | Bash 4+ shortcut |
+| Combined stream to file AND screen | `cmd 2>&1 \| tee file` | Audit + display |
+| Combined append to file AND screen | `cmd 2>&1 \| tee -a file` | Long-running jobs |
+| Preserve exit code through redirection | `(cmd; echo "exit=$?") &> log` | Wrapper trick |
+| Cron-job logging | `* * * * * /path/job &>> /var/log/job.log` | Captures everything per run |
 
-Human English:
-> "Run `ls`. Send the normal output, port `1`, into `stdout.log`. Leave errors alone."
-
-What `>` means:
-> Redirect stdout.
-
-What happens:
-- The `/etc` listing goes into `stdout.log`.
-- The `/nope` error still prints to your terminal.
-
-Then:
-```bash
-cat stdout.log
-```
-
-Human English:
-> "Open the file and show me what stdout saved."
-
-What we are proving:
-> `>` only redirects normal output. It does not catch errors.
+> **Rule one of combined streams:** The operator that opens the file goes **first**. `2>&1` (or its bash sugar) goes **second**. Always.
 
 ---
 
-## Lab 15c: Redirect stderr to a File
+## 🎯 Career Pathway Sidebar
 
-```bash
-ls /etc /nope 2> errors.log
-cat errors.log
-```
-
-Human English:
-> "Run `ls`. Send error output, port `2`, into `errors.log`. Leave normal output alone."
-
-What `2>` means:
-> Redirect stderr.
-
-What happens:
-- The `/etc` listing still prints to your terminal.
-- The `/nope` error goes into `errors.log`.
-
-What we are proving:
-> Errors have their own stream, and `2>` lets us catch only that stream.
-
----
-
-## Lab 15d: Redirect Both Streams to the Same File
-
-```bash
-ls /etc /nope > both.log 2>&1
-cat both.log
-```
-
-Human English:
-> "Send stdout to `both.log`. Then send stderr to wherever stdout is currently going."
-
-Breakdown:
-- `> both.log` sends port `1` into `both.log`.
-- `2>&1` sends port `2` to the same destination as port `1`.
-
-So the final result is:
-- stdout goes to `both.log`
-- stderr also goes to `both.log`
-
-What we are proving:
-> `2>&1` does not mean "send errors to stdout forever." It means "connect stderr to stdout's current destination right now."
-
-Order matters because Bash reads redirections left to right.
-
----
-
-## Lab 15e: Reverse the Order on Purpose
-
-```bash
-ls /etc /nope 2>&1 > reversed.log
-cat reversed.log
-```
-
-Human English:
-> "First send stderr wherever stdout is currently going. Then send stdout to `reversed.log`."
-
-The trick:
-> When `2>&1` runs first, stdout is still pointing at the terminal.
-
-So this happens:
-- stderr gets connected to the terminal.
-- stdout later gets moved to `reversed.log`.
-- stderr does not follow stdout after that.
-
-What you should notice:
-- The `/nope` error still appears on screen.
-- `reversed.log` only gets the normal `/etc` output.
-
-What we are proving:
-> Redirection order is not just decoration. Bash wires the streams in the order you write them.
-
----
-
-## Lab 15f: Send stdout and stderr to Different Files
-
-```bash
-ls /etc /nope > stdout-only.log 2> stderr-only.log
-echo "STDOUT:" && cat stdout-only.log
-echo "STDERR:" && cat stderr-only.log
-```
-
-Human English:
-> "Put normal output in one file and error output in another file."
-
-What happens:
-- `> stdout-only.log` catches port `1`.
-- `2> stderr-only.log` catches port `2`.
-
-Then the `echo` and `cat` commands label and display each file.
-
-What we are proving:
-> stdout and stderr can be handled independently.
-
-This is useful when you want clean results in one place and troubleshooting information somewhere else.
-
----
-
-## Lab 15g: Introduce `tee`
-
-```bash
-ls /etc /nope 2> >(tee errors-tee.log)
-cat errors-tee.log
-```
-
-Human English:
-> "Send stderr into `tee`. Let `tee` save the error to a file and also print it back out."
-
-What `tee` does:
-> `tee` splits a stream. It writes the stream to a file and also passes it along to stdout.
-
-What `2> >(tee errors-tee.log)` means:
-> "Take port `2`, stderr, and send it into the command `tee errors-tee.log`."
-
-What we are proving:
-> A redirected stream does not have to go directly to a file. With process substitution, it can go into another command first.
-
----
-
-## Lab 15h: Process Substitution on stdout
-
-```bash
-ls /etc /nope > >(cat > piped-stdout.log)
-cat piped-stdout.log
-```
-
-Human English:
-> "Send stdout into a temporary pipe. Feed that pipe into `cat`. Have `cat` write the output into `piped-stdout.log`."
-
-This part:
-```bash
-> >(cat > piped-stdout.log)
-```
-
-means:
-> "Redirect stdout, but instead of sending it straight to a normal file, send it into a command that Bash makes look like a file."
-
-What `>(...)` is doing:
-> Bash creates a temporary pipe behind the scenes and gives the redirect a file-like target. The command inside the parentheses reads from that pipe.
-
-What we are proving:
-> `>(cmd)` lets a command receive redirected output as if it were a file.
-
----
-
-## Lab 15i: Filter stdout with `grep`
-
-```bash
-ls /etc /nope > >(grep "^a" > starts-with-a.log) 2>/dev/null
-cat starts-with-a.log
-```
-
-Human English:
-> "Send normal output into `grep`. Keep only lines that start with `a`. Save those matching lines. Throw errors away."
-
-Breakdown:
-- `> >(grep "^a" > starts-with-a.log)` sends stdout into `grep`.
-- `grep "^a"` keeps only lines beginning with `a`.
-- `> starts-with-a.log` saves those filtered lines.
-- `2>/dev/null` sends errors into the system trash can.
-
-What `/dev/null` means:
-> A black hole. Anything sent there disappears.
-
-What we are proving:
-> Process substitution lets us filter stdout before saving it.
-
----
-
-## Lab 15j: Explain `grep -v '^/'`
-
-```bash
-ls /etc /nope > >(grep -v '^/' > stdout-noslash.log) 2>/dev/null
-cat stdout-noslash.log
-```
-
-Human English:
-> "Send stdout into `grep`. Remove any line that starts with `/`. Save whatever is left. Hide the errors."
-
-Breakdown of `grep -v '^/'`:
-- `grep` checks each line.
-- `-v` means invert the match.
-- `^` means start of the line.
-- `/` means a literal slash.
-
-So:
-> `grep -v '^/'` means "throw away lines that start with `/`."
-
-Why we care:
-> When `ls` lists multiple locations, it can print directory headers like `/etc:`. Those headers start with `/`, so this filter removes them and leaves the filenames.
-
-What we are proving:
-> We can clean up command output while it is being redirected.
-
----
-
-## Lab 15k: Process Substitution on stderr
-
-```bash
-ls /etc /nope 2> >(grep "nope" > nope-errors.log)
-cat nope-errors.log
-```
-
-Human English:
-> "Send only the error stream into `grep`. Keep only error lines that mention `nope`. Save those errors."
-
-What happens:
-- stdout still behaves normally.
-- stderr goes into the `grep "nope"` command.
-- matching error lines are saved to `nope-errors.log`.
-
-What we are proving:
-> The same process-substitution trick works on stderr too, not just stdout.
-
----
-
-## Lab 15l: Send Errors Back to the Terminal with `>&2`
-
-```bash
-ls /etc /nope 2> >(tee errors.log >&2)
-```
-
-Human English:
-> "Send stderr into `tee`. Save the errors to `errors.log`. Then send what `tee` prints back out through stderr so the user still sees it as an error."
-
-Breakdown:
-- `2> >( ... )` sends the original command's stderr into the command inside the parentheses.
-- `tee errors.log` saves that stream into `errors.log`.
-- `>&2` sends `tee`'s output back to stderr.
-
-Why `>&2` matters:
-> Without `>&2`, `tee` would print to stdout. With `>&2`, the message stays an error message.
-
-What we are proving:
-> We can log errors and still show them to the user in the correct stream.
-
----
-
-## Lab 15m: Combine Both Streams at the Same Time
-
-```bash
-ls /etc /nope \
-  > >(grep -v '^/' > stdout-noslash.log) \
-  2> >(tee errors-only.log >&2)
-```
-
-Human English:
-> "Run `ls /etc /nope`. Send normal output into a cleanup filter and save it. Send errors into `tee`, save them, and still show them on screen as errors."
-
-Left side:
-```bash
-ls /etc /nope
-```
-
-means:
-> "Create both normal output and an error."
-
-stdout side:
-```bash
-> >(grep -v '^/' > stdout-noslash.log)
-```
-
-means:
-> "Take normal output, remove lines starting with `/`, and save the cleaned result to `stdout-noslash.log`."
-
-stderr side:
-```bash
-2> >(tee errors-only.log >&2)
-```
-
-means:
-> "Take error output, save it to `errors-only.log`, and also send it back to stderr so it still appears as an error."
-
-What we are doing overall:
-> We are treating normal output and error output as two separate streams, processing each stream differently, and saving each one in the form we want.
-
----
-
-## Lab 15n: Verify the Files
-
-```bash
-echo "---- stdout-noslash.log (first 3 lines) ----"
-head -3 stdout-noslash.log
-
-echo "---- errors-only.log ----"
-cat errors-only.log
-```
-
-Human English:
-> "Show me the first few cleaned stdout lines, then show me the saved error message."
-
-What `head -3 stdout-noslash.log` does:
-> Prints only the first three lines of the cleaned stdout file.
-
-What `cat errors-only.log` does:
-> Prints the saved error log.
-
-Expected result:
-- `stdout-noslash.log` contains filenames, without `/etc:` style headers.
-- `errors-only.log` contains the `/nope` error.
-
-What we are proving:
-> The final command sent each stream to the right place and processed each one correctly.
-
----
-
-## Lab 15o: Break It on Purpose with `sh`
-
-```bash
-sh -c 'ls /etc /nope > >(cat)'
-```
-
-Human English:
-> "Ask plain `sh` to run a Bash-style process substitution."
-
-Expected result:
-> It fails with a syntax error.
-
-Why it fails:
-> `>(...)` is not POSIX `sh` syntax. It is a Bash/Zsh feature.
-
-What we are proving:
-> Process substitution depends on the shell. If your script uses `>(...)`, make sure it runs under Bash, not plain `sh`.
-
-For a script, that usually means the top line should be:
-
-```bash
-#!/bin/bash
-```
-
----
-
-## The Final Command as One Story
-
-```bash
-ls /etc /nope \
-  > >(grep -v '^/' > stdout-noslash.log) \
-  2> >(tee errors-only.log >&2)
-```
-
-Story version:
-> `ls` tries to list `/etc` and `/nope`. `/etc` works and creates normal output. `/nope` fails and creates error output. Bash keeps those two streams separate. The normal output gets sent into `grep -v '^/'`, which removes directory-header lines starting with `/`, then saves the cleaned list into `stdout-noslash.log`. The error output gets sent into `tee`, which saves it into `errors-only.log` and also sends it back to stderr so the user still sees the error on screen.
-
----
-
-## Quick Cheat Sheet
-
-| Syntax | Human meaning |
+| Level | Why this lab matters |
 |---|---|
-| `>` | redirect stdout, port `1` |
-| `2>` | redirect stderr, port `2` |
-| `2>&1` | send stderr to stdout's current destination |
-| `>(cmd)` | make a command act like a file target |
-| `> >(cmd)` | send stdout into a command |
-| `2> >(cmd)` | send stderr into a command |
-| `tee file` | save a stream to a file and also print it |
-| `>&2` | send output to stderr |
-| `/dev/null` | discard whatever is sent there |
+| **RHCSA candidate** | Exam Task 14 says "save the output of `find / -mtime -30` to a file." Combined-stream capture (`&>` or `> file 2>&1`) avoids the broken half-capture that loses the `Permission denied` evidence. |
+| **RHCE candidate** | Ansible `command:` / `shell:` exposes `result.stdout` and `result.stderr` separately. To replicate `&>` in Ansible, capture both and concatenate. |
+| **SRE / Platform** | Incident response: `cmd &>> /tmp/incident-$(date +%s).log` is the unambiguous "I want everything that command says, in time order." |
+| **DevOps** | CI/CD pipelines: every job's "Raw logs" panel is combined-stream — your local equivalent is `make build &> build.log`. |
+| **AI / MLOps** | `python train.py &> runs/exp.log` captures epoch metrics (stdout) and PyTorch warnings (stderr) into one log for postmortem analysis. |
 
 ---
 
-## What Task 15 Is Really Teaching
+## 🔧 The 6 Tasks
 
-Task 15 is not just about one weird-looking command.
+> Six exam-realistic phases that build the **stdout + stderr → one file → verify** habit.
 
-It is teaching you how to think like Bash:
-> "Which stream is this? Where is that stream going? Am I sending it to a file, throwing it away, merging it, or feeding it into another command?"
+---
 
-Once you can answer those questions, commands like this stop looking random:
+### Task 1 — Set up the sandbox and confirm streams are still independent
 
-```bash
-command > >(process_stdout) 2> >(process_stderr >&2)
-```
-
-They become readable:
-> "Handle normal output one way. Handle errors another way."
-
-### Task 16 — Whole-script redirection with `exec`
-
-**Purpose:** Redirect every subsequent command in a script with one statement.
+**Purpose:** Build a clean working directory, generate one well-defined success and one well-defined failure on the same command, and re-prove from Lab 02 that `>` alone misses the error.
 
 ```bash
-cat > script-with-exec.sh <<'EOF'
-#!/bin/bash
-exec > script-output.log 2>&1
-echo "Start: $(date)"
-ls /etc /nope
-echo "End: $(date)"
-EOF
-chmod +x script-with-exec.sh
-./script-with-exec.sh
-cat script-output.log
+mkdir -p /tmp/combo-lab && cd /tmp/combo-lab
+
+ls /etc /nope                       # success on stdout, error on stderr
+ls /etc /nope > out.txt              # `>` alone — error still on screen
+cat out.txt
+ls /etc /nope > out.txt 2> err.txt   # split
+cat err.txt
 ```
+
+**Human-Readable Breakdown:** Build the sandbox, run the same `ls /etc /nope` three different ways: default (both on screen), `>` only (stderr still on screen, file has only stdout), `> ... 2> ...` (split into two files).
+
+**Reading it left to right:** Default `ls` writes paths to FD 1 and "cannot access" to FD 2; both happen to land on the terminal. `> out.txt` rebinds FD 1 only — FD 2 still hits the terminal. The split form rebinds both, but into different files.
+
+**The story:** Every combined-stream conversation starts with this proof. If you cannot see the split, you will not appreciate the merge.
 
 **Expected output:**
 
+```text
+ls: cannot access '/nope': No such file or directory
+/etc:
+adjtime
+aliases
+...
+ls: cannot access '/nope': No such file or directory
+(out.txt has only the /etc listing)
+ls: cannot access '/nope': No such file or directory
 ```
-Start: Thu May 21 14:00:00 EDT 2026
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `ls A B` | List two paths |
+| `> file` | Send stdout only |
+| `2> file` | Send stderr only |
+| `> a 2> b` | Send to two files |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| `out.txt` has both streams | You used `&>` or `2>&1` — try plain `>` |
+| `err.txt` is empty | The error did not happen — confirm with default `ls /etc /nope` |
+| `cd: /tmp/combo-lab: No such file or directory` | `mkdir -p` it first |
+
+---
+
+### Task 2 — Merge with bash shorthand `&>`
+
+**Purpose:** Use bash's `&>` operator to capture **both** streams into one file with the shortest possible syntax.
+
+```bash
+cd /tmp/combo-lab
+
+ls /etc /nope &> both.txt
+cat both.txt
+wc -l both.txt
+
+find /etc -name '*.conf' &> /tmp/combo-lab/find.log
+wc -l find.log
+head -n 3 find.log
+tail -n 3 find.log
+```
+
+**Human-Readable Breakdown:** Replace `> file 2> file2` with a single `&> file` — bash opens the file once and binds both FD 1 and FD 2 to it. Confirm with `cat`/`wc -l`/`head`/`tail` that both streams ended up interleaved in time order.
+
+**Reading it left to right:** `&>` is bash sugar for `> file 2>&1`. The shell opens `both.txt` with `O_TRUNC`, binds it to FD 1, then duplicates FD 1 onto FD 2. The kernel sees both `write(1, ...)` and `write(2, ...)` from `ls`/`find` and both writes go to the same file, in the order they happen.
+
+**The story:** `&>` is the bash one-liner you reach for at the command line. Anything you would have written with two redirections collapses into one operator. The cost is that `&>` does not work in `/bin/sh` — that's what Task 3 is for.
+
+**Expected output:**
+
+```text
 ls: cannot access '/nope': No such file or directory
 /etc:
 adjtime
 ...
-End: Thu May 21 14:00:00 EDT 2026
+234 both.txt
+358 find.log
+/etc/dnf/dnf.conf
+/etc/sysctl.conf
+/etc/yum.conf
+find: ‘/etc/audit’: Permission denied
+find: ‘/etc/pki/CA/private’: Permission denied
+find: ‘/etc/sudoers.d’: Permission denied
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `exec > FILE 2>&1` | From this point forward, all stdout AND stderr in the running shell go to FILE |
-| `<<'EOF' ... EOF` | Heredoc — embed script content inline |
-| `chmod +x` | Make script executable |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| Each line | All commands' output captured automatically — no per-command redirection needed |
-
-**Why a sysadmin needs this on RHCA RH358:** Service start scripts; capture everything for postmortem with one `exec` line at the top.
+| `&> file` | Bash — both streams to file (overwrite) |
+| `wc -l file` | Count lines |
+| `head -n N` | First N lines |
+| `tail -n N` | Last N lines |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `bash: exec: too many arguments` | Don't put commands after the FILE — `exec` only takes the redirection |
+| `bash: &>: command not found` | You are in `/bin/dash` or `/bin/sh` — switch to bash or use `> file 2>&1` |
+| Lines look out of order | Buffered I/O — stderr is unbuffered, stdout is line-buffered to a pipe |
+| File overwritten | `&>` is overwrite mode — use `&>>` for append |
 
 ---
 
-### Task 17 — Suppress permission noise on `find /`
+### Task 3 — Merge with POSIX `> file 2>&1` and learn the order rule
 
-**Purpose:** Classic exam pattern — search the whole filesystem without drowning in errors.
+**Purpose:** Use the POSIX-portable form that works in **every** Bourne-family shell, and prove to yourself that operator order matters.
 
 ```bash
-find / -name 'passwd' 2>/dev/null | head -5
-find / -name 'passwd' > /var/tmp/passwd-hits.txt 2>&1
-echo "lines: $(wc -l < /var/tmp/passwd-hits.txt)"
-head -5 /var/tmp/passwd-hits.txt
+cd /tmp/combo-lab
+
+ls /etc /nope > correct.log 2>&1
+cat correct.log
+
+ls /etc /nope 2>&1 > wrong.log
+cat wrong.log
+
+echo "---compare wrong.log to correct.log---"
+wc -l correct.log wrong.log
 ```
+
+**Human-Readable Breakdown:** Run the same command twice with `2>&1` placed in two different positions. The "correct" form (operator at end) merges both streams into the file. The "wrong" form (operator before `>`) sends stderr to the terminal and only stdout to the file.
+
+**Reading it left to right:** `> correct.log` opens the file on FD 1, then `2>&1` duplicates FD 1's new value (the file) onto FD 2. Both flow into the file. In the wrong form, `2>&1` runs first — FD 1 still points at the terminal at that moment, so FD 2 also points at the terminal. The subsequent `> wrong.log` only rebinds FD 1.
+
+**The story:** This is the single most common shell bug. Every senior engineer learned this rule by debugging a "broken" cron log. Walk through the kernel calls in your head every time, until it's automatic.
 
 **Expected output:**
 
-```
-/etc/passwd
-/etc/pam.d/passwd
-/usr/bin/passwd
-/usr/share/bash-completion/completions/passwd
-/usr/share/man/man1/passwd.1ssl.gz
-lines: 5  (approximate, hit count varies)
-/etc/passwd
-/etc/pam.d/passwd
-...
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `find /` | Search from root |
-| `-name 'passwd'` | Match exact filename |
-| `2>/dev/null` | Hide permission denied / proc errors |
-| `> file 2>&1` | Capture both — useful when the grader wants the full picture |
-
-**Output decoded**
-
-| Phase | What you see |
-|---|---|
-| First | Clean, filtered list (no noise) |
-| Second (file) | Hits AND any errors — useful if grader checks the file |
-
-**Why a sysadmin needs this on RHCSA Task 14:** Different graders want different things — know both patterns.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Find hangs forever | `/proc` and `/sys` have weird files — add `-xdev` to stay on one filesystem |
-
----
-
-### Task 18 — Capture into a variable
-
-**Purpose:** Use a command's output (including errors) in a script variable.
-
-```bash
-result=$(ls /etc /nope 2>&1)
-echo "result has $(echo "$result" | wc -l) lines"
-echo "first 3:"
-echo "$result" | head -3
-```
-
-**Expected output:**
-
-```
-result has 184 lines    (number varies)
-first 3:
+```text
 ls: cannot access '/nope': No such file or directory
 /etc:
 adjtime
+...
+ls: cannot access '/nope': No such file or directory   ← printed to terminal
+/etc:
+adjtime
+...                                                     ← printed to wrong.log only
+---compare wrong.log to correct.log---
+235 correct.log
+234 wrong.log     ← one line short — the stderr line is missing
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `$( ... )` | Command substitution — runs the command and captures its stdout |
-| `2>&1` inside | Merge stderr into stdout so both are captured into the variable |
-| `"$result"` | Quote so newlines are preserved when echoed |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `lines: N` | Total lines captured |
-| First three | First three lines of combined output |
-
-**Why a sysadmin needs this on RHCE EX294:** Same pattern Ansible's `command:` module uses internally — knowing it helps debug `register: result` outputs.
+| `> file 2>&1` | POSIX — merge both into file |
+| `2>&1 > file` | POSIX — but wrong: stderr stays on terminal |
+| `wc -l a b` | Line counts for both files |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Trailing newline missing | Bash strips trailing newlines from `$()` — usually harmless |
+| `wrong.log` and `correct.log` have the same line count | Re-check operator order — `2>&1` must come **after** `> file` |
+| Both files are empty | Both streams produced nothing — verify with the bare command |
+| `2>&1` shows on screen as text | You quoted it — `'2>&1'` is literal |
 
 ---
 
-### Task 19 — Cron job with full capture
+### Task 4 — Append both streams and build a cron-style log
 
-**Purpose:** Cron emails errors by default. Most production jobs send everything to a log file instead.
+**Purpose:** Use the append forms (`&>>` and `>> file 2>&1`) to accumulate the complete output of repeated commands into one growing log — the canonical cron-job logging pattern.
 
 ```bash
-crontab -l > my-current-cron.bak 2>/dev/null || true
-cat > my-new-cron.txt <<'EOF'
-# Captures both stdout AND stderr into /var/log/myjob.log
-*/5 * * * *  /usr/local/bin/myjob.sh >> /var/log/myjob.log 2>&1
+cd /tmp/combo-lab
 
-# Or bash 4+ shorthand:
-# */5 * * * *  /usr/local/bin/myjob.sh &>> /var/log/myjob.log
-EOF
-cat my-new-cron.txt
+> job.log
+for i in 1 2 3; do
+  echo "===== run $i $(date -Is) =====" &>> job.log
+  ls /etc /nope/$i &>> job.log
+done
+
+cat job.log
+wc -l job.log
+
+dnf check-update >> job.log 2>&1 || true
+tail -n 10 job.log
 ```
+
+**Human-Readable Breakdown:** Truncate `job.log` with the empty `>`. Run a loop three times, each iteration appending both streams to the same log with `&>>`. Then append a `dnf check-update` (which exits 100 when updates are available — we use `|| true` to avoid breaking the script).
+
+**Reading it left to right:** `> job.log` opens the file with `O_TRUNC` and immediately closes — net effect: file is now empty. Each loop iteration opens the log in append mode, binds both streams, and writes. Each `dnf check-update` line also appends both streams.
+
+**The story:** Every cron job on every production server worth running uses this pattern — `* * * * * /path/job >> /var/log/job.log 2>&1`. When the job fails at 03:00 and you wake up at 09:00, the complete log is sitting there waiting for you.
 
 **Expected output:**
 
-```
-# Captures both stdout AND stderr into /var/log/myjob.log
-*/5 * * * *  /usr/local/bin/myjob.sh >> /var/log/myjob.log 2>&1
-
-# Or bash 4+ shorthand:
-# */5 * * * *  /usr/local/bin/myjob.sh &>> /var/log/myjob.log
+```text
+===== run 1 2026-05-26T13:10:00-04:00 =====
+ls: cannot access '/nope/1': No such file or directory
+/etc:
+adjtime
+...
+===== run 2 2026-05-26T13:10:00-04:00 =====
+ls: cannot access '/nope/2': No such file or directory
+...
+===== run 3 ... =====
+...
+720 job.log
+Last metadata expiration check: ...
+Dependencies resolved.
+================================================================================
+ Package          Architecture          Version                    Repository ...
+================================================================================
+...
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `*/5 * * * *` | Every 5 minutes (m/h/dom/mon/dow) |
-| `>> FILE 2>&1` | Append both streams to FILE |
-| `&>>` | Bash shorthand |
-| `crontab -l` | List current user's crontab |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| The `*/5 ...` row | A working cron entry that loses NOTHING |
-
-**Why a sysadmin needs this on RHCSA Task 13:** Cron jobs that "silently failed" almost always lack `2>&1`. Adding it is the #1 fix.
+| `> file` (no command) | Truncate a file to zero bytes |
+| `&>> file` | Bash — both streams, append |
+| `>> file 2>&1` | POSIX — both streams, append |
+| `\|\| true` | Force overall exit 0 even if previous command failed |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Cron emails you every error | Add `>> log 2>&1` and email stops, log grows |
-| Log doesn't update | Path wrong, permissions wrong, or job exits before running — check `MAILTO=root` for now |
+| Log overwritten between iterations | You wrote `&>` instead of `&>>` |
+| Log entries interleave from parallel processes | `>>` is per-write atomic in append mode for small writes; for safety use `flock` |
+| `dnf check-update` exit code 100 | Normal — it means updates are available; `\|\| true` handles it |
 
 ---
 
-### Task 20 — Exam-style scenario: capture, display, and verify
+### Task 5 — Discard both streams with `&> /dev/null`
 
-**Task statement (RHCSA-style):** *"Run `find / -mtime -30` and capture both the file list AND any permission errors into `/var/tmp/modfiles.txt`. Also show progress on screen as it runs. Then verify with a line count and a sample."*
+**Purpose:** Use `&> /dev/null` (or the POSIX `> /dev/null 2>&1`) to silence a command completely — useful for background services, cron jobs whose output you do not need, and noisy tools you only care about by exit code.
 
 ```bash
-sudo find / -mtime -30 2>&1 | sudo tee /var/tmp/modfiles.txt | head -20
-echo "----"
-sudo wc -l /var/tmp/modfiles.txt
-sudo grep -c "Permission denied" /var/tmp/modfiles.txt
-sudo head -5 /var/tmp/modfiles.txt
+cd /tmp/combo-lab
+
+dnf list installed &> /dev/null
+echo "dnf exit: $?"
+
+find / -name '*.conf' &> /dev/null
+echo "find exit: $?"
+
+ls /nope &> /dev/null
+echo "ls exit: $?"
+
+systemctl status sshd &> /dev/null && echo "sshd is running"
+systemctl status fake-nonexistent &> /dev/null || echo "fake-nonexistent failed"
 ```
 
-**Expected output (excerpts):**
+**Human-Readable Breakdown:** Run loud commands silently and rely on the **exit code** to know what happened. `&> /dev/null` discards both streams; `$?` and `&&` / `||` give you the truthful result.
 
+**Reading it left to right:** `&> /dev/null` opens the null device on FD 1 and FD 2 — every byte the command writes is discarded by the kernel. `echo "ls exit: $?"` reports the prior command's exit status. `&& echo X` runs `echo` only if the prior command succeeded; `|| echo Y` runs only if it failed.
+
+**The story:** `/dev/null` is the canonical Linux trash can. Inside services and scripts, silencing both streams while still using exit codes is how senior engineers write code that "just runs without spam." Pair with `set -e` and your scripts get loud only when something genuinely breaks.
+
+**Expected output:**
+
+```text
+dnf exit: 0
+find exit: 0
+ls exit: 2
+sshd is running
+fake-nonexistent failed
 ```
-/etc/resolv.conf
-/etc/hostname
-find: '/proc/1/task/1/fd/4': No such file or directory
-...
-----
-12345 /var/tmp/modfiles.txt   (line count varies)
-422   (Permission denied count varies)
-/etc/resolv.conf
-/etc/hostname
-/var/log/messages
-...
-```
 
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| `find / -mtime -30` | Files modified in the last 30 days |
-| `2>&1` | Merge stderr into stdout so tee sees both |
-| `\| sudo tee /var/tmp/modfiles.txt` | Display AND save in one go (sudo needed because `/var/tmp` writes as caller; here actually fine but kept for habit) |
-| `\| head -20` | Show only first 20 lines on screen during the run |
-| `wc -l` | Audit: total lines captured |
-| `grep -c "Permission denied"` | Audit: how many errors got captured (confirms `2>&1` worked) |
-
-**Output decoded**
+**Switches**
 
 | Token | Meaning |
 |---|---|
-| File listing rows | stdout of `find` |
-| `Permission denied` / `No such file...` rows | stderr — captured thanks to `2>&1` |
-| `wc -l` | Total entries in the log |
-| `grep -c` result > 0 | Proves errors were captured (not lost) |
+| `&> /dev/null` | Bash — discard both streams |
+| `> /dev/null 2>&1` | POSIX — discard both streams |
+| `cmd && X` | Run X only if cmd succeeded |
+| `cmd \|\| Y` | Run Y only if cmd failed |
+| `systemctl status NAME` | Exit code reflects unit state |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| Errors still on screen | You wrote `> /dev/null` (stdout only) — add `2>&1` |
+| `$?` is `0` even on missing service | `systemctl status` exit codes vary — use `systemctl is-active` for boolean |
+| `&&` and `\|\|` both fired | Operator-precedence trap — wrap with parens |
+
+---
+
+### Task 6 — Capstone: RHCSA-realistic combined-stream capture
+
+**Task statement:** *"Run `find /etc -type f -name '*.conf'` and save **both** the matching paths and any `Permission denied` errors to `/root/find-evidence.log`. Verify that the log contains successful matches AND at least one `Permission denied` line."*
+
+**Purpose:** Execute a full exam-style answer end-to-end using the combined-stream pattern, then verify the artifact the way a grader would.
+
+```bash
+sudo -i
+
+# Run as a non-root account so we actually generate Permission denied lines
+su - ec2-user -c "find /etc -type f -name '*.conf' &> /root/find-evidence.log"
+# (run as root if you do not have a non-root user; the file still gets both
+#  streams, there just won't be any Permission denied messages)
+
+wc -l /root/find-evidence.log
+echo "--- matches ---"
+grep '\.conf$' /root/find-evidence.log | head -n 3
+echo "--- errors ---"
+grep 'Permission denied' /root/find-evidence.log | head -n 3
+
+test -s /root/find-evidence.log && echo "VERIFY: file exists and is non-empty"
+grep -q 'Permission denied' /root/find-evidence.log && echo "VERIFY: errors captured"
+grep -q '\.conf$' /root/find-evidence.log && echo "VERIFY: data captured"
+```
+
+**Human-Readable Breakdown:** Run the `find` as a non-root user so it genuinely encounters unreadable directories, and merge both streams into `/root/find-evidence.log` with `&>`. Verify that the file is non-empty, contains real `.conf` paths, and contains at least one `Permission denied` line.
+
+**Layer stack you built:**
+
+```text
+/root/find-evidence.log           <- the artifact a grader reads
+  ├── stdout of find ...          <- captured by `&>` (FD 1 → file)
+  └── stderr of find ...          <- captured by `&>` (FD 2 → same file)
+```
+
+**The story:** This is the **canonical 60-second exam answer** when the prompt says "save the output" without telling you which stream. Default to combined-stream capture — you lose nothing and you may save the answer when stderr was the real data source. Memorize the spine: `cmd &> /path/file` or the POSIX `cmd > /path/file 2>&1`, then verify with `grep -q` and `test -s`.
+
+**Expected verification output:**
+
+```text
+532 /root/find-evidence.log
+--- matches ---
+/etc/dnf/dnf.conf
+/etc/ssh/sshd_config.d/50-redhat.conf
+/etc/yum.conf
+--- errors ---
+find: ‘/etc/audit’: Permission denied
+find: ‘/etc/pki/CA/private’: Permission denied
+find: ‘/etc/sudoers.d’: Permission denied
+VERIFY: file exists and is non-empty
+VERIFY: errors captured
+VERIFY: data captured
+```
 
 **Cleanup**
 
 ```bash
-cd ~
-rm -rf ~/redir-lab
-sudo rm -f /var/tmp/modfiles.txt /var/tmp/passwd-hits.txt /root/sudoed.log
+rm -rf /tmp/combo-lab
+rm -f /root/find-evidence.log
+exit
 ```
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Tee shows the listing but file is empty | Pipe targets only stdout; ensure `2>&1` is BEFORE the pipe |
-| Permission denied to write `/var/tmp/...` | Use `sudo tee` |
+| File has only `.conf` paths, no errors | You ran as root — try as a non-root user |
+| File has only errors, no `.conf` paths | The `find` filter is wrong, or the path has no `.conf` files |
+| `&>` syntax error | Running in `/bin/sh` not `/bin/bash` — switch shell or use `> file 2>&1` |
+| `grep -q` printed nothing but echo did not fire | The `&&` chain detected a failure — read each `grep` output by hand |
 
 ---
 
-## 🔍 Redirection Decision Guide
+## 🔍 Combined-Stream Decision Guide
 
 ```
-Do you want to SAVE the output?
-  ├── Stdout only? → > file        (>> to append)
-  ├── Stderr only? → 2> file       (2>> to append)
-  ├── Both?
-  │     ├── Overwrite → > file 2>&1     or     &> file
-  │     └── Append    → >> file 2>&1    or     &>> file
-  ├── Discard?     → cmd > /dev/null   /   2> /dev/null   /   &> /dev/null
-  └── Want to see AND save?  → cmd 2>&1 | tee file       (use tee -a to append)
-
-Need to write as root?
-  └── sudo cmd 2>&1 | sudo tee /root/file
-
-Whole script captured?
-  └── exec > /var/log/myscript.log 2>&1   (at the top)
-
-Separate streams to different files?
-  └── cmd > stdout.log 2> stderr.log
+Got command output you want to capture COMPLETELY?
+  │
+  ├── "Bash one-liner, just merge them"
+  │       └── ✅ cmd &> file
+  │
+  ├── "Same, append form"
+  │       └── ✅ cmd &>> file
+  │
+  ├── "Must run in /bin/sh or busybox"
+  │       └── ✅ cmd > file 2>&1
+  │
+  ├── "Same, append form"
+  │       └── ✅ cmd >> file 2>&1
+  │
+  ├── "I want to see it AND save it"
+  │       └── ✅ cmd 2>&1 | tee file       (or `| tee -a file` to append)
+  │
+  ├── "Discard everything; rely on exit code"
+  │       └── ✅ cmd &> /dev/null
+  │       └── ✅ cmd > /dev/null 2>&1
+  │
+  ├── "Pipe combined stream to another command"
+  │       └── ✅ cmd 2>&1 | next            (POSIX)
+  │       └── ✅ cmd |& next                (bash 4+)
+  │
+  └── "Preserve exit code of cmd even after the redirect"
+          └── ✅ Just check `$?` immediately after — redirection never changes it
 ```
 
 ---
 
-## ✅ Lab Checklist (20 Tasks)
+## ✅ Lab Checklist (6 Tasks)
 
-- [ ] 01 Set up `~/redir-lab`
-- [ ] 02 See stdout and stderr both on screen with `ls /etc /nonexistent`
-- [ ] 03 Capture stdout only with `>`
-- [ ] 04 Capture stderr only with `2>`
-- [ ] 05 Recognize the wrong order `2>&1 > file`
-- [ ] 06 Apply the correct order `> file 2>&1`
-- [ ] 07 Read `2>&1` as "send 2 to where 1 is going"
-- [ ] 08 Use the `&>` shorthand
-- [ ] 09 Append both streams with `&>>`
-- [ ] 10 Append the portable way with `>> file 2>&1`
-- [ ] 11 Send streams to two separate files
-- [ ] 12 Discard a stream with `/dev/null`
-- [ ] 13 Use `2>&1 \| tee file` to see + save
-- [ ] 14 Write as root with `sudo tee`
-- [ ] 15 Process substitution `> >(grep ...)` and `2> >(tee ...)`
-- [ ] 16 `exec > log 2>&1` for whole-script capture
-- [ ] 17 Suppress `find /` permission errors with `2>/dev/null`
-- [ ] 18 Capture combined output into a variable with `$(cmd 2>&1)`
-- [ ] 19 Cron entry that captures both streams with `>> log 2>&1`
-- [ ] 20 Exam scenario: `find / -mtime -30` captured + teed + audited
+- [ ] 01 Set up `/tmp/combo-lab`, reproduce the stdout-vs-stderr split, and prove `>` alone is incomplete
+- [ ] 02 Merge with bash `&>` and verify both streams landed in the same file
+- [ ] 03 Merge with POSIX `> file 2>&1` and demonstrate the broken `2>&1 > file` order
+- [ ] 04 Build a cron-style log with `&>>` (or `>> file 2>&1`) across multiple runs
+- [ ] 05 Discard both streams with `&> /dev/null` and lean on `$?`, `&&`, `\|\|`
+- [ ] 06 Execute the RHCSA capstone — capture `find /etc -name '*.conf'` data **and** errors into `/root/find-evidence.log` and verify
 
 ---
 
@@ -1500,35 +575,35 @@ Separate streams to different files?
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| `2>&1 > file` (wrong order) | Errors still on screen, file has only stdout | Write `> file 2>&1` |
-| `>` when you meant `>>` | Existing log destroyed | Use `>>` or `&>>` for appends |
-| `sudo cmd > /root/file` | `Permission denied` | `sudo cmd \| sudo tee /root/file` or `sudo bash -c 'cmd > /root/file'` |
-| Forgetting `2>&1` in cron | Errors disappear (cron emails them instead) | Always `>> log 2>&1` in cron lines |
-| Confusing `&` for background | `2>&1` is **not** background; `&` alone at end is | Read `&` in `>&` as "the same FD" |
-| `&>` on `/bin/sh` | Syntax error | Switch to `#!/bin/bash` or use long form |
-| `> file 2> file` (same file, separate redirects) | Race conditions — content can interleave badly | Use `> file 2>&1` instead |
+| `2>&1` placed before `>` | Stderr stays on screen | `2>&1` always **after** the `>` |
+| Used `&>` in `/bin/sh` | `bash: &>: command not found` | Use `> file 2>&1` for portability |
+| `&>>` typo as `&> >` | Bash parse error | Single token `&>>` |
+| Two separate appends `>>file 2>>file` | Bytes can interleave/drop | Use `>>file 2>&1` |
+| Discarded both streams of a long-running job | No way to debug failures | Capture to a file, not `/dev/null` |
+| Forgot exit code is preserved | Assumed `&>` zeros `$?` | `$?` is the **command's** exit, not the redirection's |
+| Combined stream in a pipe but only stderr matters | Hard to filter | `cmd 2>&1 \| grep -i error` |
+| `tee` after merge captures both | Expected screen to remain quiet | `tee` writes to its own stdout — use `tee file > /dev/null` to silence screen |
+| Cron job with no redirection | Mail spool fills up | Always `&>> /var/log/job.log` for cron |
+| Output truncated mid-line | `cmd` killed by SIGKILL mid-write | Use `set -o pipefail` and check `$?` |
 
 ---
 
-## 📌 Exam Strategy
+## 🎯 Career & Interview Strategy
 
-**RHCSA EX200**
-- Every "save the output" task = `> file 2>&1` (or `&> file`). Default to capturing BOTH.
-- `find / ... > /var/tmp/file 2>&1` is the literal answer for Task 14.
-- Use `sudo tee` whenever the destination is owned by root.
+**RHCSA candidate**
+- When the prompt says "save the output," default to combined-stream. You can always grep down later. `cmd &> /root/answer.txt` is the safe one-character upgrade from `cmd > /root/answer.txt`.
 
-**RHCE EX294 (Ansible)**
-- `command:` and `shell:` modules capture both streams. Access them as `result.stdout` and `result.stderr`.
-- `failed_when:` often checks `'error' in result.stderr` — knowing how streams flow matters.
+**RHCE candidate**
+- Ansible exposes `stdout` and `stderr` separately. To emulate `&>`, register the result and concatenate `result.stdout ~ "\n" ~ result.stderr` into a `copy: content:` task.
 
-**CKA**
-- `kubectl logs POD &> /tmp/pod.log` to grab everything for triage.
-- `journalctl -u kubelet --since "10 min ago" &> /tmp/kubelet.log` is the canonical postmortem capture.
+**SRE / Platform interview**
+- "How would you debug a cron job that 'works fine' but produces wrong results?" → "I would change the crontab line to `* * * * * /path/job &>> /var/log/job.log` and read the next run's log for stderr warnings."
 
-**RHCA**
-- RH342: `exec > /var/log/incident-$(date +%s).log 2>&1` at the top of remediation scripts.
-- RH358: service forensics — `systemctl status SERVICE 2>&1 \| tee /tmp/svc.log`.
-- RH236: Gluster ops emit warnings to stderr — always combine with `2>&1`.
+**DevOps**
+- Container `ENTRYPOINT` should not redirect — let stdout and stderr flow into the container runtime's log driver, which combines them. But local `make` jobs benefit from `make build &> build.log`.
+
+**AI / MLOps**
+- Long training runs: `python train.py --epochs 100 &> runs/exp-$(date +%s).log`. Combines metrics and warnings — when accuracy drops on epoch 47, the warning that explains it is in the same log.
 
 ---
 
@@ -1536,16 +611,15 @@ Separate streams to different files?
 
 | Lab | Connection |
 |---|---|
-| Lab 05 — Directory navigation | You must know your path before redirecting into it |
-| Lab 06 — `ls -lZ` | Verifying log file ownership and SELinux context after creation |
-| Lab 08 — `cp` | Capturing `cp -av` output for audit |
-| Lab 11 — `rm` | `rm -rfv DIR > /tmp/deleted.log 2>&1` for audit-friendly deletion |
-| Lab 14 — `find` | The canonical command that needs `2>&1` |
-| Lab 18 — `dnf` install | `dnf install -y X 2>&1 \| tee /var/tmp/install.log` |
+| Lab 01 — Standard Output Redirection | Half of this lab — the FD 1 side |
+| Lab 02 — Standard Error Redirection | The other half — the FD 2 side |
+| Lab 03 — Pipe Text Streams | Combine `2>&1` with `\|` for stderr-aware pipelines |
+| Lab 14 — File Searching with `find` | The command most often paired with combined-stream capture |
+| Lab 20 — Scrolling Through Large Files | Read the combined log you just produced with `less` |
 
 ---
 
 ## 👤 Author
 
-**Kelvin R. Tobias**  
+**Kelvin R. Tobias**
 [kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
